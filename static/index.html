@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Strider</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  :root {
+    --ink: #1d2b3a;
+    --sky: #f4f7f9;
+    --teal: #0e7c86;
+    --amber: #f2a900;
+    --line: #d5dde3;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; font-family: "Atkinson Hyperlegible", system-ui, sans-serif; color: var(--ink); }
+  #map { position: absolute; inset: 0; }
+
+  .bar {
+    position: absolute; z-index: 1000; top: 12px; left: 12px; right: 12px;
+    max-width: 440px; background: var(--sky); border: 2px solid var(--ink);
+    border-radius: 10px; padding: 12px 14px; box-shadow: 4px 4px 0 var(--ink);
+  }
+  .bar h1 { margin: 0; font-size: 1.35rem; letter-spacing: -0.01em; }
+  .bar p { margin: 4px 0 10px; font-size: 0.95rem; line-height: 1.4; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .legend { font-size: 0.85rem; display: flex; gap: 10px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-weight: 700; cursor: pointer; border-radius: 8px;
+    border: 2px solid var(--ink); background: var(--teal); color: #fff; padding: 7px 12px;
+  }
+  button.ghost { background: #fff; color: var(--ink); }
+  button:focus-visible, select:focus-visible, input:focus-visible { outline: 3px solid var(--amber); outline-offset: 2px; }
+
+  .search { display: grid; gap: 6px; margin-top: 10px; }
+  .search input {
+    font: inherit; width: 100%; padding: 7px 9px; background: #fff;
+    border: 2px solid var(--ink); border-radius: 8px;
+  }
+
+  .pin {
+    width: 34px; height: 34px; border-radius: 50% 50% 50% 4px; transform: rotate(-45deg);
+    border: 2px solid var(--ink); display: grid; place-items: center;
+  }
+  .pin span { transform: rotate(45deg); font-size: 16px; line-height: 1; }
+
+  .leaflet-popup-content { font-family: "Atkinson Hyperlegible", system-ui, sans-serif; margin: 12px 14px; }
+  .leaflet-popup-content select, .leaflet-popup-content input {
+    font: inherit; width: 100%; margin: 4px 0 8px; padding: 6px; border: 2px solid var(--ink); border-radius: 6px;
+  }
+  .meta { font-size: 0.85rem; margin: 4px 0 8px; }
+
+  #toast {
+    position: absolute; z-index: 1100; left: 50%; bottom: 24px; transform: translateX(-50%);
+    background: var(--ink); color: #fff; padding: 10px 16px; border-radius: 8px;
+    max-width: 90%; opacity: 0; pointer-events: none; transition: opacity 0.2s;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="bar">
+  <h1>Strider</h1>
+  <p>Tap the map to report a blind spot. Other students see it right away.</p>
+  <div class="row">
+    <button id="plan" type="button">Plan a walk</button>
+    <button id="locate" class="ghost" type="button">Find me</button>
+    <div class="legend" id="legend"></div>
+  </div>
+  <div class="search">
+    <input id="from-q" placeholder="Start (blank = my location)" aria-label="Start location" autocomplete="off">
+    <input id="to-q" placeholder="Where to?" aria-label="Destination" autocomplete="off">
+    <label class="meta">Leaving at (blank = now)
+      <input id="when" type="time">
+    </label>
+    <button id="search-go" type="button">Find safe route</button>
+  </div>
+  <div class="meta" id="routeInfo"></div>
+</div>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+  // ---- Config: change these for your project ----
+  const SUPABASE_URL = "https://fricshvgatflahhkqltu.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_6dIqTAJPaZqgRfMGGcmHoQ_t-_Y21aR"; // publishable key only, never the secret key
+  const CAMPUS_CENTER = [37.8719, -122.2585]; // UC Berkeley; swap in your campus
+
+  const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+  const GONE_NEEDED = 3; // keep equal to gone_needed in the vote_report SQL function
+
+  // Anonymous sign-in gives each browser a real identity, so votes and rate limits are enforced by the database
+  let signInError = null;
+  const signInReady = (async () => {
+    const { data } = await db.auth.getSession();
+    if (data.session) return true;
+    const { error } = await db.auth.signInAnonymously();
+    if (error) { signInError = error.message; console.error("Anonymous sign-in failed:", error); return false; }
+    return true;
+  })();
+
+  // Use before any action that needs an identity. Warns on every failure instead of failing silently.
+  async function canAct() {
+    if (await signInReady) return true;
+    toast("Sign-in failed: " + signInError + ". Enable Anonymous sign-ins in Supabase (Authentication, Sign In / Providers).");
+    return false;
+  }
+
+  const TYPES = {
+    broken_light:     { label: "Broken light",       emoji: "💡", color: "#f2a900" },
+    unmonitored_path: { label: "Unmonitored path",   emoji: "👁️", color: "#9b7bd8" },
+    wildlife:         { label: "Aggressive wildlife", emoji: "🦝", color: "#e8665d" },
+    other:            { label: "Other hazard",       emoji: "⚠️", color: "#8fa3b3" },
+  };
+
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  function toast(msg) {
+    const t = document.getElementById("toast");
+    t.textContent = msg;
+    t.classList.add("show");
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => t.classList.remove("show"), 3500);
+  }
+
+  // ---- Map ----
+  const map = L.map("map", { zoomControl: false }).setView(CAMPUS_CENTER, 16);
+  L.control.zoom({ position: "bottomright" }).addTo(map);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "&copy; OpenStreetMap contributors",
+  }).addTo(map);
+
+  document.getElementById("legend").innerHTML = Object.values(TYPES)
+    .map((t) => `<span>${t.emoji} ${t.label}</span>`).join("");
+
+  // ---- Hazard pins ----
+  const markers = new Map(); // report id -> { marker, expires }
+
+  function pinIcon(type) {
+    const t = TYPES[type] || TYPES.other;
+    return L.divIcon({
+      className: "",
+      html: `<div class="pin" style="background:${t.color}"><span>${t.emoji}</span></div>`,
+      iconSize: [34, 34],
+      iconAnchor: [8, 34],
+      popupAnchor: [10, -34],
+    });
+  }
+
+  function reportPopup(r) {
+    const t = TYPES[r.type] || TYPES.other;
+    const when = new Date(r.created_at).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+    return `
+      <strong>${t.emoji} ${esc(t.label)}</strong>
+      ${r.description ? `<div>${esc(r.description)}</div>` : ""}
+      <div class="meta">Reported ${esc(when)}. Confirmed by ${r.confirmations} ${r.confirmations === 1 ? "person" : "people"}.${r.gone_votes > 0 ? ` ${r.gone_votes} of ${GONE_NEEDED} say it's gone.` : ""}</div>
+      <div class="row">
+        <button type="button" onclick="confirmReport('${esc(r.id)}')">Still there</button>
+        <button type="button" class="ghost" onclick="resolveReport('${esc(r.id)}')">It's gone</button>
+      </div>`;
+  }
+
+  function showReport(r) {
+    removeReport(r.id);
+    if (new Date(r.expires_at) <= new Date()) return;
+    const marker = L.marker([r.lat, r.lng], { icon: pinIcon(r.type), title: (TYPES[r.type] || TYPES.other).label })
+      .bindPopup(reportPopup(r))
+      .addTo(map);
+    markers.set(r.id, { marker, expires: new Date(r.expires_at) });
+  }
+
+  function removeReport(id) {
+    const entry = markers.get(id);
+    if (entry) { map.removeLayer(entry.marker); markers.delete(id); }
+  }
+
+  // Fade out expired reports without reloading
+  setInterval(() => {
+    const now = new Date();
+    for (const [id, { expires }] of markers) if (expires <= now) removeReport(id);
+  }, 60000);
+
+  async function loadReports() {
+    const { data, error } = await db.from("hazard_reports").select("*")
+      .gt("expires_at", new Date().toISOString());
+    if (error) return toast("Couldn't load reports. Check your Supabase URL and key.");
+    data.forEach(showReport);
+  }
+
+  // ---- Report a blind spot ----
+  map.on("click", (e) => {
+    if (routeMode) return handleRouteClick(e.latlng);
+    const options = Object.entries(TYPES)
+      .map(([k, t]) => `<option value="${k}">${t.emoji} ${t.label}</option>`).join("");
+    L.popup()
+      .setLatLng(e.latlng)
+      .setContent(`
+        <label>What's wrong here?
+          <select id="r-type">${options}</select>
+        </label>
+        <label>Details (optional)
+          <input id="r-desc" maxlength="140" placeholder="Lamp out near the stairs">
+        </label>
+        <button type="button" onclick="submitReport(${e.latlng.lat}, ${e.latlng.lng})">Report blind spot</button>`)
+      .openOn(map);
+  });
+
+  async function submitReport(lat, lng) {
+    const type = document.getElementById("r-type").value;
+    const description = document.getElementById("r-desc").value.trim() || null;
+    map.closePopup();
+    if (!(await canAct())) return;
+    const { error } = await db.from("hazard_reports").insert({ type, description, lat, lng });
+    if (error) { console.error(error); return toast("Report failed: " + error.message); }
+    toast("Reported. Thanks for looking out for others.");
+  }
+
+  async function confirmReport(id) {
+    if (!(await canAct())) return;
+    const { error } = await db.rpc("vote_report", { p_report: id, p_vote: "confirm" });
+    if (error) return toast("Couldn't confirm: " + error.message);
+    map.closePopup();
+    toast("Thanks. The report stays up for another 48 hours.");
+  }
+
+  // ---- Live updates from other students ----
+  db.channel("hazard-reports")
+    .on("postgres_changes", { event: "*", schema: "public", table: "hazard_reports" }, (payload) => {
+      if (payload.eventType === "DELETE") return removeReport(payload.old.id);
+      showReport(payload.new);
+      if (payload.eventType === "INSERT") {
+        toast(`New report: ${(TYPES[payload.new.type] || TYPES.other).label}`);
+      }
+    })
+    .subscribe();
+
+  // ---- Find me ----
+  let me = null;
+  document.getElementById("locate").addEventListener("click", () => map.locate({ setView: true, maxZoom: 17 }));
+  map.on("locationfound", (e) => {
+    if (me) map.removeLayer(me);
+    me = L.circleMarker(e.latlng, { radius: 8, color: "#fff", weight: 3, fillColor: "#0e7c86", fillOpacity: 1 }).addTo(map);
+  });
+  map.on("locationerror", () => toast("Couldn't get your location. Allow location access in your browser."));
+
+  // ---- Mark a hazard as gone ----
+  // One vote per person. The report disappears once enough people say it's gone,
+  // or right away if the person who reported it removes it.
+  async function resolveReport(id) {
+    if (!(await canAct())) return;
+    const { error } = await db.rpc("vote_report", { p_report: id, p_vote: "gone" });
+    if (error) return toast("Couldn't record your vote: " + error.message);
+    map.closePopup();
+    toast(`Vote recorded. It's removed once ${GONE_NEEDED} people say it's gone.`);
+  }
+
+  // ---- Safest route ----
+  let routeMode = false;
+  let routePts = [];
+  const routeLayers = L.layerGroup().addTo(map);
+  const planBtn = document.getElementById("plan");
+  const routeInfo = document.getElementById("routeInfo");
+
+  function resetRoute() {
+    routeMode = false;
+    routePts = [];
+    routeLayers.clearLayers();
+    routeInfo.textContent = "";
+    planBtn.textContent = "Plan a walk";
+  }
+
+  planBtn.addEventListener("click", () => {
+    if (routeMode || routeLayers.getLayers().length) return resetRoute();
+    routeMode = true;
+    planBtn.textContent = "Cancel";
+    routeInfo.textContent = "Tap your starting point.";
+  });
+
+  async function handleRouteClick(latlng) {
+    routePts.push(latlng);
+    L.circleMarker(latlng, { radius: 8, color: "#1d2b3a", weight: 2, fillOpacity: 1,
+      fillColor: routePts.length === 1 ? "#0e7c86" : "#f2a900" }).addTo(routeLayers);
+    if (routePts.length === 1) { routeInfo.textContent = "Now tap your destination."; return; }
+
+    return drawRoute(routePts[0], routePts[1]);
+  }
+
+  function walkHour() {
+    const v = document.getElementById("when").value;
+    return v ? parseInt(v.slice(0, 2), 10) : new Date().getHours();
+  }
+
+  async function drawRoute(a, b) {
+    routeMode = false;
+    routeInfo.textContent = "Finding the safest route...";
+    try {
+      const res = await fetch(`/api/route?from_lat=${a.lat}&from_lng=${a.lng}&to_lat=${b.lat}&to_lng=${b.lng}&hour=${walkHour()}`);
+      const text = await res.text();
+      let r;
+      try { r = JSON.parse(text); }
+      catch { throw new Error(`Server error ${res.status}: ${text.slice(0, 120)}`); }
+      if (!res.ok) throw new Error(r.detail || "Route failed");
+      L.polyline(r.fastest.coords, { color: "#8fa3b3", weight: 5, dashArray: "8 8" }).addTo(routeLayers);
+      const safe = L.polyline(r.safest.coords, { color: "#0e7c86", weight: 7 }).addTo(routeLayers);
+      map.fitBounds(safe.getBounds(), { padding: [90, 60] });
+      const busy = (x) => x.traffic_pct >= 60 ? "busy" : x.traffic_pct >= 30 ? "moderate" : "quiet";
+      const line = (name, x) => `${name}: ${x.minutes} min, ${x.lit_pct}% lit, foot traffic ${busy(x)}, ${x.hazard_segments} hazard ${x.hazard_segments === 1 ? "spot" : "spots"}`;
+      routeInfo.innerHTML = `<strong style="color:#0e7c86">Solid teal</strong> ${esc(line("Safest", r.safest))}<br>` +
+        `<strong style="color:#6b7f8f">Dashed grey</strong> ${esc(line("Fastest", r.fastest))}`;
+      planBtn.textContent = "Clear route";
+    } catch (err) {
+      resetRoute();
+      toast(err.message);
+    }
+  }
+
+  // ---- Search for start and end ----
+  // Uses OpenStreetMap's Nominatim. It's meant for occasional lookups, so we search on
+  // Enter or button press (not as you type) and wait between the two requests.
+  const [cLat, cLng] = CAMPUS_CENTER;
+  const ROUTE_RADIUS_M = 3000; // keep equal to RADIUS_M in main.py
+  const dLat = ROUTE_RADIUS_M / 111000;
+  const dLng = dLat / Math.cos((cLat * Math.PI) / 180);
+  const VIEWBOX = `${cLng - dLng},${cLat + dLat},${cLng + dLng},${cLat - dLat}`; // matches the routable area
+  const fromQ = document.getElementById("from-q");
+  const toQ = document.getElementById("to-q");
+
+  async function geocode(q) {
+    const url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&viewbox=" +
+      VIEWBOX + "&bounded=1&q=" + encodeURIComponent(q);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Place search is unavailable right now. Tap the map instead.");
+    const hits = await res.json();
+    if (!hits.length) throw new Error(`Couldn't find "${q}" near campus. Try a different name.`);
+    return L.latLng(Number(hits[0].lat), Number(hits[0].lon));
+  }
+
+  function pointDot(latlng, color) {
+    L.circleMarker(latlng, { radius: 8, color: "#1d2b3a", weight: 2, fillColor: color, fillOpacity: 1 }).addTo(routeLayers);
+  }
+
+  async function searchRoute() {
+    const fq = fromQ.value.trim();
+    const tq = toQ.value.trim();
+    if (!tq) return toast("Enter a destination.");
+    if (!fq && !me) return toast("Enter a start, or tap Find me first.");
+    resetRoute();
+    routeInfo.textContent = "Searching...";
+    try {
+      const a = fq ? await geocode(fq) : me.getLatLng();
+      if (fq) await new Promise((r) => setTimeout(r, 1100));
+      const b = await geocode(tq);
+      routePts = [a, b];
+      pointDot(a, "#0e7c86");
+      pointDot(b, "#f2a900");
+      await drawRoute(a, b);
+    } catch (err) {
+      resetRoute();
+      toast(err.message);
+    }
+  }
+
+  document.getElementById("search-go").addEventListener("click", searchRoute);
+  [fromQ, toQ].forEach((el) => el.addEventListener("keydown", (e) => { if (e.key === "Enter") searchRoute(); }));
+
+  // ---- Emergency phones and police stations ----
+  const phoneLayer = L.layerGroup().addTo(map);
+  const policeLayer = L.layerGroup().addTo(map);
+  L.control.layers(null, { "Emergency phones": phoneLayer, "Police stations": policeLayer }, { collapsed: false }).addTo(map);
+
+  async function loadSafePoints() {
+    try {
+      const res = await fetch("/api/safe-points");
+      if (!res.ok) throw new Error("Map data still loading");
+      const d = await res.json();
+      d.phones.forEach((p) =>
+        L.circleMarker([p.lat, p.lng], { radius: 7, color: "#fff", weight: 2, fillColor: "#1b5fd1", fillOpacity: 1 })
+          .bindTooltip(esc(p.name || "Emergency phone")).addTo(phoneLayer));
+      d.police.forEach((p) =>
+        L.marker([p.lat, p.lng], {
+          icon: L.divIcon({ className: "", iconSize: [34, 34], iconAnchor: [8, 34], popupAnchor: [10, -34],
+            html: `<div class="pin" style="background:#3b6fd4"><span>🚓</span></div>` }),
+        }).bindPopup(`<strong>🚓 ${esc(p.name || "Police station")}</strong>`).addTo(policeLayer));
+    } catch {
+      setTimeout(loadSafePoints, 5000); // the server may still be downloading map data
+    }
+  }
+
+  loadSafePoints();
+  loadReports();
+</script>
+</body>
+</html>

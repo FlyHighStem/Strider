@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+osmnx
+networkx
+geopandas
+shapely
+numpy
+supabase
+python-dotenv
+scikit-learn
